@@ -84,7 +84,7 @@
 
 ## 更新前
 
+- 这个个人仓库刻意移除了 `.github` 自动化，不跑 GitHub Actions / Dependabot。
 - 重新套补丁前先做 `git apply --check`。
 - 更新后确认 custom `codex_responses` 的 `User-Agent` 修复还在。
 - `memory_policy.yaml` 在本机 Hermes home 里。
-

@@ -137,12 +137,14 @@ def _containing_skills_root(skill_path: Path) -> Path:
 def _pinned_guard(name: str) -> Optional[str]:
     """Return a refusal message if *name* is pinned, else None.
 
-    Pin protects a skill from **deletion** — both the curator's auto-archive
-    passes and the agent's ``skill_manage(action="delete")`` tool call. The
-    agent can still patch/edit pinned skills; pin only guards against
-    irrecoverable loss, not against content evolution.
+    Pinned skills are off-limits to the agent's skill_manage tool.  The only
+    way to modify one is for the user to unpin it via
+    ``hermes curator unpin <name>`` (or edit it directly by hand).  This
+    mirrors the curator's own pinned-skip behavior but extends the guard
+    to tool-driven writes as well, giving users a hard fence against
+    accidental agent edits.
 
-    Best-effort: if the sidecar is unreadable we let the delete through
+    Best-effort: if the sidecar is unreadable we let the write through
     rather than block on a broken telemetry file.
     """
     try:
@@ -150,14 +152,55 @@ def _pinned_guard(name: str) -> Optional[str]:
         rec = skill_usage.get_record(name)
         if rec.get("pinned"):
             return (
-                f"Skill '{name}' is pinned and cannot be deleted by "
+                f"Skill '{name}' is pinned and cannot be modified by "
                 f"skill_manage. Ask the user to run "
-                f"`hermes curator unpin {name}` if they want to delete it. "
-                f"Patches and edits are allowed on pinned skills; only "
-                f"deletion is blocked."
+                f"`hermes curator unpin {name}` if they want the change."
             )
     except Exception:
         logger.debug("pinned-guard lookup failed for %s", name, exc_info=True)
+    return None
+
+
+def _bundled_hub_guard(name: str) -> Optional[str]:
+    """Return a refusal message if *name* is a bundled or hub-installed skill.
+
+    Bundled skills (shipped with Hermes) and hub-installed skills (pulled
+    via ``hermes skills install``) are off-limits to ``skill_manage`` —
+    a poisoned skill could otherwise tell the curator to overwrite a
+    trusted bundled skill via prompt injection. The curator's prompt
+    text says "DO NOT touch bundled or hub-installed skills" but that
+    is an LLM instruction, not a code-level enforced boundary.
+
+    Best-effort: if we cannot determine the skill's source we let the
+    write through rather than block on a broken state.
+    """
+    try:
+        from tools.skills_sync import _get_bundled_dir, _discover_bundled_skills
+        bundled_dir = _get_bundled_dir()
+        if bundled_dir.exists():
+            bundled_names = {bname for bname, _ in _discover_bundled_skills(bundled_dir)}
+            if name in bundled_names:
+                return (
+                    f"Skill '{name}' is a bundled skill and cannot be modified "
+                    f"by skill_manage. Bundled skills ship with Hermes and are "
+                    f"protected from agent edits. To override, copy the skill "
+                    f"to your local skills directory first."
+                )
+
+        try:
+            from hermes_constants import get_hermes_home
+            hub_marker = get_hermes_home() / "skills" / name / ".hub-source"
+            if hub_marker.exists():
+                return (
+                    f"Skill '{name}' is a hub-installed skill and cannot be modified "
+                    f"by skill_manage. Hub skills are managed via "
+                    f"`hermes skills update`. To override, copy the skill to a "
+                    f"different name first."
+                )
+        except Exception:
+            logger.debug("hub-marker lookup failed for %s", name, exc_info=True)
+    except Exception:
+        logger.debug("bundled-hub-guard lookup failed for %s", name, exc_info=True)
     return None
 
 
@@ -283,13 +326,11 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
     """
-    from agent.skill_utils import EXCLUDED_SKILL_DIRS, get_all_skills_dirs
+    from agent.skill_utils import get_all_skills_dirs
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
         for skill_md in skills_dir.rglob("SKILL.md"):
-            if any(part in EXCLUDED_SKILL_DIRS for part in skill_md.parts):
-                continue
             if skill_md.parent.name == name:
                 return {"path": skill_md.parent}
     return None
@@ -441,6 +482,14 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found. Use skills_list() to see available skills."}
 
+    bundled_err = _bundled_hub_guard(name)
+    if bundled_err:
+        return {"success": False, "error": bundled_err}
+
+    pinned_err = _pinned_guard(name)
+    if pinned_err:
+        return {"success": False, "error": pinned_err}
+
     skill_md = existing["path"] / "SKILL.md"
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
@@ -480,6 +529,14 @@ def _patch_skill(
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
+
+    bundled_err = _bundled_hub_guard(name)
+    if bundled_err:
+        return {"success": False, "error": bundled_err}
+
+    pinned_err = _pinned_guard(name)
+    if pinned_err:
+        return {"success": False, "error": pinned_err}
 
     skill_dir = existing["path"]
 
@@ -570,6 +627,10 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
 
+    bundled_err = _bundled_hub_guard(name)
+    if bundled_err:
+        return {"success": False, "error": bundled_err}
+
     pinned_err = _pinned_guard(name)
     if pinned_err:
         return {"success": False, "error": pinned_err}
@@ -639,6 +700,14 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found. Create it first with action='create'."}
 
+    bundled_err = _bundled_hub_guard(name)
+    if bundled_err:
+        return {"success": False, "error": bundled_err}
+
+    pinned_err = _pinned_guard(name)
+    if pinned_err:
+        return {"success": False, "error": pinned_err}
+
     target, err = _resolve_skill_target(existing["path"], file_path)
     if err:
         return {"success": False, "error": err}
@@ -672,6 +741,14 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
+
+    bundled_err = _bundled_hub_guard(name)
+    if bundled_err:
+        return {"success": False, "error": bundled_err}
+
+    pinned_err = _pinned_guard(name)
+    if pinned_err:
+        return {"success": False, "error": pinned_err}
 
     skill_dir = existing["path"]
 
@@ -770,17 +847,10 @@ def skill_manage(
             pass
         # Curator telemetry: bump patch_count on edit/patch/write_file (the actions
         # that mutate an existing skill's guidance), drop the record on delete.
-        # Only mark a skill as agent-created when the background self-improvement
-        # review fork creates it — foreground `skill_manage(create)` calls are
-        # user-directed, and those skills belong to the user (the curator must
-        # not touch them). Best-effort; telemetry failures never break the tool.
+        # Best-effort; telemetry failures never break the tool.
         try:
-            from tools.skill_usage import bump_patch, forget, mark_agent_created
-            from tools.skill_provenance import is_background_review
-            if action == "create":
-                if is_background_review():
-                    mark_agent_created(name)
-            elif action in {"patch", "edit", "write_file", "remove_file"}:
+            from tools.skill_usage import bump_patch, forget
+            if action in ("patch", "edit", "write_file", "remove_file"):
                 bump_patch(name)
             elif action == "delete":
                 forget(name)
@@ -821,10 +891,9 @@ SKILL_MANAGE_SCHEMA = {
         "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
         "Good skills: trigger conditions, numbered steps with exact commands, "
         "pitfalls section, verification steps. Use skill_view() to see format examples.\n\n"
-        "Pinned skills are protected from deletion only — skill_manage(action='delete') "
-        "will refuse with a message pointing the user to `hermes curator unpin <name>`. "
-        "Patches and edits go through on pinned skills so you can still improve them as "
-        "pitfalls come up; pin only guards against irrecoverable loss."
+        "Pinned skills are off-limits — all write actions refuse with a message "
+        "pointing the user to `hermes curator unpin <name>`. Don't try to route "
+        "around this by renaming or recreating."
     ),
     "parameters": {
         "type": "object",

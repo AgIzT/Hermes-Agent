@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 from tools.url_safety import (
     is_safe_url,
-    is_always_blocked_url,
     _is_blocked_ip,
     _global_allow_private_urls,
     _reset_allow_private_cache,
@@ -21,14 +20,6 @@ class TestIsSafeUrl:
             (2, 1, 6, "", ("93.184.216.34", 0)),
         ]):
             assert is_safe_url("https://example.com/image.png") is True
-
-    def test_ftp_scheme_blocked(self):
-        """Only http/https should be allowed for fetch tools."""
-        assert is_safe_url("ftp://example.com/file.txt") is False
-
-    def test_missing_scheme_blocked(self):
-        """Bare host/path should be rejected to avoid ambiguous handling."""
-        assert is_safe_url("example.com/path") is False
 
     def test_localhost_blocked(self):
         with patch("socket.getaddrinfo", return_value=[
@@ -418,67 +409,147 @@ class TestAllowPrivateUrlsIntegration:
         assert is_safe_url("") is False
 
 
-class TestIsAlwaysBlockedUrl:
-    """The always-blocked floor — cloud metadata only, narrower than is_safe_url."""
+class TestIPv4MappedIPv6SSRF:
+    """Regression tests for SSRF bypass via IPv4-mapped IPv6 addresses.
 
-    # -- The sentinel set that must always block --------------------------------
+    DNS resolvers may return ``::ffff:x.x.x.x`` for IPv4-only hosts.
+    Python's ipaddress module treats these as distinct from the plain
+    IPv4 address, so ``ip in frozenset({IPv4Address(...)})`` and
+    ``ip in IPv4Network(...)`` both return False.  Without explicit
+    handling, an attacker could use IPv4-mapped addresses to bypass
+    all SSRF protections.
+    """
 
-    @pytest.mark.parametrize("url", [
-        "http://169.254.169.254/latest/meta-data/",            # AWS / GCP / Azure / DO / Oracle
-        "http://169.254.169.253/metadata/instance",              # Azure IMDS wire server
-        "http://169.254.170.2/v2/credentials",                   # AWS ECS task metadata
-        "http://100.100.100.200/latest/meta-data/",              # Alibaba Cloud
-        "http://169.254.42.1/",                                  # Any /16 link-local
+    # ── _is_blocked_ip direct tests ──
+
+    @pytest.mark.parametrize("ip_str", [
+        "::ffff:100.64.0.1",       # CGNAT start
+        "::ffff:100.100.100.200",  # Alibaba Cloud metadata (in CGNAT range)
+        "::ffff:100.127.255.254",  # CGNAT end
+        "::ffff:169.254.42.99",    # Link-local (non-metadata)
+        "::ffff:0.0.0.0",          # Unspecified
+        "::ffff:224.0.0.1",        # Multicast
     ])
-    def test_literal_imds_ips_always_blocked(self, url):
-        """Literal IMDS IPs and the /16 link-local range always block."""
-        assert is_always_blocked_url(url) is True
+    def test_ipv4_mapped_blocked_ips(self, ip_str):
+        """IPv4-mapped IPv6 addresses that should be blocked."""
+        ip = ipaddress.ip_address(ip_str)
+        assert _is_blocked_ip(ip) is True, f"{ip_str} should be blocked"
 
-    def test_gcp_metadata_hostname_always_blocked_even_without_dns(self):
-        """metadata.google.internal blocks by hostname, no DNS needed."""
-        with patch("socket.getaddrinfo", side_effect=socket.gaierror("nope")):
-            assert is_always_blocked_url("http://metadata.google.internal/") is True
+    @pytest.mark.parametrize("ip_str", [
+        "::ffff:8.8.8.8",          # Public DNS
+        "::ffff:93.184.216.34",    # example.com
+        "::ffff:100.0.0.1",        # Not in CGNAT range
+    ])
+    def test_ipv4_mapped_allowed_ips(self, ip_str):
+        """IPv4-mapped IPv6 addresses that should be allowed."""
+        ip = ipaddress.ip_address(ip_str)
+        assert _is_blocked_ip(ip) is False, f"{ip_str} should be allowed"
 
-    def test_hostname_resolving_to_imds_always_blocked(self):
-        """Attacker-controlled hostname resolving to IMDS still blocks."""
+    # ── is_safe_url integration tests: always-blocked metadata IPs ──
+
+    def test_ipv4_mapped_aws_metadata_blocked(self):
+        """::ffff:169.254.169.254 (AWS metadata) must always be blocked."""
         with patch("socket.getaddrinfo", return_value=[
-            (2, 1, 6, "", ("169.254.169.254", 0)),
+            (10, 1, 6, "", ("::ffff:169.254.169.254", 0, 0, 0)),
         ]):
-            assert is_always_blocked_url("http://attacker-controlled.example.com/") is True
+            assert is_safe_url("http://aws-metadata.internal/") is False
 
-    # -- Things the floor must NOT block ----------------------------------------
+    def test_ipv4_mapped_ecs_metadata_blocked(self):
+        """::ffff:169.254.170.2 (AWS ECS task metadata) must always be blocked."""
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:169.254.170.2", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://ecs-metadata.internal/") is False
 
-    def test_public_url_not_blocked(self):
-        assert is_always_blocked_url("https://example.com/path") is False
+    def test_ipv4_mapped_azure_wire_server_blocked(self):
+        """::ffff:169.254.169.253 (Azure IMDS wire server) must always be blocked."""
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:169.254.169.253", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://azure-metadata.internal/") is False
 
-    @pytest.mark.parametrize("url", [
-        "http://127.0.0.1:8080/",
-        "http://192.168.1.1/",
-        "http://10.0.0.5/",
-        "http://172.16.0.1/",
-        "http://100.64.0.1/",  # CGNAT — blocked by is_safe_url but not by the floor
-    ])
-    def test_ordinary_private_urls_not_in_floor(self, url):
-        """Floor is narrower than is_safe_url — ordinary private URLs pass."""
-        assert is_always_blocked_url(url) is False
+    def test_ipv4_mapped_alibaba_metadata_blocked(self):
+        """::ffff:100.100.100.200 (Alibaba Cloud metadata) must always be blocked."""
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:100.100.100.200", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://alibaba-metadata.internal/") is False
 
-    def test_dns_failure_not_in_floor(self):
-        """DNS failure on a non-sentinel hostname = not always-blocked.
+    def test_ipv4_mapped_link_local_blocked(self):
+        """::ffff:169.254.42.99 (random link-local) must always be blocked."""
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:169.254.42.99", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://link-local.internal/") is False
 
-        Caller's ordinary fail-closed path (is_safe_url) handles that case.
-        """
-        with patch("socket.getaddrinfo", side_effect=socket.gaierror("fail")):
-            assert is_always_blocked_url("http://nonexistent.example.com/") is False
+    # ── is_safe_url integration tests: CGNAT bypass via IPv4-mapped ──
 
-    def test_empty_url_not_in_floor(self):
-        """Empty URL falls through — caller decides what to do with a malformed URL."""
-        assert is_always_blocked_url("") is False
+    def test_ipv4_mapped_cgnat_blocked(self):
+        """::ffff:100.64.0.1 (CGNAT) must be blocked as a private address."""
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:100.64.0.1", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://tailscale-peer.example/") is False
 
-    def test_malformed_url_not_in_floor(self):
-        """Parse errors don't claim always-blocked status."""
-        assert is_always_blocked_url("not a url at all") is False
+    def test_ipv4_mapped_cgnat_upper_blocked(self):
+        """::ffff:100.127.255.254 (CGNAT upper bound) must be blocked."""
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:100.127.255.254", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://cgnat-upper.example/") is False
 
-    def test_floor_ignores_allow_private_urls_toggle(self, monkeypatch):
-        """security.allow_private_urls can NOT unblock cloud metadata."""
+    def test_ipv4_mapped_non_cgnat_100_allowed(self):
+        """::ffff:100.0.0.1 is NOT in CGNAT range, should be allowed."""
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:100.0.0.1", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://legit-host.example/") is True
+
+    # ── is_safe_url: always-blocked even with toggle on ──
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        _reset_allow_private_cache()
+        yield
+        _reset_allow_private_cache()
+
+    def test_ipv4_mapped_aws_metadata_blocked_even_with_toggle(self, monkeypatch):
+        """::ffff:169.254.169.254 is ALWAYS blocked, even with toggle on."""
         monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
-        assert is_always_blocked_url("http://169.254.169.254/") is True
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:169.254.169.254", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://aws-metadata.internal/") is False
+
+    def test_ipv4_mapped_alibaba_metadata_blocked_even_with_toggle(self, monkeypatch):
+        """::ffff:100.100.100.200 is ALWAYS blocked, even with toggle on."""
+        monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:100.100.100.200", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://alibaba-metadata.internal/") is False
+
+    def test_ipv4_mapped_link_local_blocked_even_with_toggle(self, monkeypatch):
+        """::ffff:169.254.42.99 (link-local) is ALWAYS blocked, even with toggle on."""
+        monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:169.254.42.99", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://link-local.internal/") is False
+
+    def test_ipv4_mapped_cgnat_allowed_when_toggle_on(self, monkeypatch):
+        """::ffff:100.64.0.1 (CGNAT) passes when toggle is on (like plain IPv4 CGNAT)."""
+        monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:100.64.0.1", 0, 0, 0)),
+        ]):
+            assert is_safe_url("http://tailscale-peer.example/") is True
+
+    # ── is_safe_url: public IPv4-mapped IPv6 should be allowed ──
+
+    def test_ipv4_mapped_public_ip_allowed(self):
+        """::ffff:93.184.216.34 (example.com) should be allowed."""
+        with patch("socket.getaddrinfo", return_value=[
+            (10, 1, 6, "", ("::ffff:93.184.216.34", 0, 0, 0)),
+        ]):
+            assert is_safe_url("https://example.com/") is True

@@ -56,15 +56,13 @@ _SENSITIVE_BODY_KEYS = frozenset({
 })
 
 # Snapshot at import time so runtime env mutations (e.g. LLM-generated
-# `export HERMES_REDACT_SECRETS=false`) cannot disable redaction
-# mid-session.  ON by default — secure default per issue #17691. Users who
-# need raw credential values in tool output (e.g. working on the redactor
-# itself) can opt out via `security.redact_secrets: false` in config.yaml
-# (bridged to this env var in hermes_cli/main.py, gateway/run.py, and
-# cli.py) or `HERMES_REDACT_SECRETS=false` in ~/.hermes/.env. An opt-out
-# warning is logged at gateway and CLI startup so operators see the
-# downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
-_REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
+# `export HERMES_REDACT_SECRETS=...`) cannot enable/disable redaction
+# mid-session.  ON by default to prevent accidental credential leaks in
+# gateway chat output and session logs.  Users who need raw output can
+# opt out via `security.redact_secrets: false` in config.yaml (bridged
+# to this env var in hermes_cli/main.py and gateway/run.py) or
+# `HERMES_REDACT_SECRETS=false` in ~/.hermes/.env.
+_REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in ("1", "true", "yes", "on")
 
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
@@ -105,10 +103,34 @@ _PREFIX_PATTERNS = [
     r"brv_[A-Za-z0-9]{10,}",            # ByteRover API key
 ]
 
-# ENV assignment patterns: KEY=value where KEY contains a secret-like name
-_SECRET_ENV_NAMES = r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)"
+# ENV assignment patterns: KEY=value where KEY contains a secret-like name.
+# Two tiers:
+#   1. UPPERCASE_ONLY keys (e.g. OPENAI_API_KEY=…) — original strict pattern.
+#   2. Lowercase/dotted config-style keys (e.g. password=…,
+#      spring.datasource.password=…) — only matches when there is NO space
+#      before '=' (prevents matching code like `token = await getToken()`).
+_SECRET_ENV_NAMES_UPPER = r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)"
 _ENV_ASSIGN_RE = re.compile(
-    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
+    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES_UPPER}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
+)
+
+# Lowercase / dotted config-style keys.  Must use NO-space before '=' to
+# avoid false-positives on code assignments like `secret = await fetch()`.
+# Handles: password=val, spring.datasource.password=val, db.secret='val'
+_SECRET_CONFIG_NAMES = r"(?:api[_-]?key|token|secret|password|passwd|credential|auth)"
+_CONFIG_ASSIGN_RE = re.compile(
+    rf"([a-zA-Z0-9_.\-]{{0,80}}[.\-]{_SECRET_CONFIG_NAMES})=(['\"]?)([^\s'\"&#]+)\2"
+    r"|"  # OR bare keyword (no namespace prefix)
+    rf"(?<![a-zA-Z0-9_.\-])({_SECRET_CONFIG_NAMES})=(['\"]?)([^\s'\"&#]+)\5",
+    re.IGNORECASE,
+)
+
+# YAML-style config keys: `password: value` or `spring.datasource.password: value`
+# Requires colon-space (`: `) — YAML spec mandates space after colon for mappings.
+# Only matches when value is NOT a mapping/anchor/comment (starts with non-special char).
+_YAML_CONFIG_RE = re.compile(
+    rf"([a-zA-Z0-9_.\-]{{0,80}}(?:\.)?{_SECRET_CONFIG_NAMES}):\s+(\S+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
@@ -308,18 +330,14 @@ def _redact_form_body(text: str) -> str:
     return _redact_query_string(text.strip())
 
 
-def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False) -> str:
+def redact_sensitive_text(text: str, *, force: bool = False) -> str:
     """Apply all redaction patterns to a block of text.
 
     Safe to call on any string -- non-matching text passes through unchanged.
-    Disabled by default — enable via security.redact_secrets: true in config.yaml.
+    Enabled by default to prevent credential leaks in gateway output and logs.
+    Disable via security.redact_secrets: false in config.yaml or HERMES_REDACT_SECRETS=false in .env.
     Set force=True for safety boundaries that must never return raw secrets
     regardless of the user's global logging redaction preference.
-
-    Set code_file=True to skip the ENV-assignment and JSON-field regex
-    patterns when the text is known to be source code (e.g. MAX_TOKENS=***
-    constants, "apiKey": "test" fixtures). Prefix patterns, auth headers,
-    private keys, DB connstrings, JWTs, and URL secrets are still redacted.
     """
     if text is None:
         return None
@@ -333,18 +351,33 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     # Known prefixes (sk-, ghp_, etc.)
     text = _PREFIX_RE.sub(lambda m: _mask_token(m.group(1)), text)
 
-    # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
-    if not code_file:
-        def _redact_env(m):
-            name, quote, value = m.group(1), m.group(2), m.group(3)
-            return f"{name}={quote}{_mask_token(value)}{quote}"
-        text = _ENV_ASSIGN_RE.sub(_redact_env, text)
+    # ENV assignments: OPENAI_API_KEY=sk-abc...
+    def _redact_env(m):
+        name, quote, value = m.group(1), m.group(2), m.group(3)
+        return f"{name}={quote}{_mask_token(value)}{quote}"
+    text = _ENV_ASSIGN_RE.sub(_redact_env, text)
 
-        # JSON fields: "apiKey": "***"  (skip for code files — false positives)
-        def _redact_json(m):
-            key, value = m.group(1), m.group(2)
-            return f'{key}: "{_mask_token(value)}"'
-        text = _JSON_FIELD_RE.sub(_redact_json, text)
+    # Lowercase / dotted config assignments: password=abc, spring.datasource.password=abc
+    def _redact_config(m):
+        # Two branches in the alternation:
+        if m.group(1) is not None:  # namespaced: spring.datasource.password=val
+            name, quote, value = m.group(1), m.group(2), m.group(3)
+        else:  # bare keyword: password=val
+            name, quote, value = m.group(4), m.group(5), m.group(6)
+        return f"{name}={quote}{_mask_token(value)}{quote}"
+    text = _CONFIG_ASSIGN_RE.sub(_redact_config, text)
+
+    # YAML-style config assignments: password: secret, spring.datasource.password: secret
+    def _redact_yaml_config(m):
+        name, value = m.group(1), m.group(2)
+        return f"{name}: {_mask_token(value)}"
+    text = _YAML_CONFIG_RE.sub(_redact_yaml_config, text)
+
+    # JSON fields: "apiKey": "value"
+    def _redact_json(m):
+        key, value = m.group(1), m.group(2)
+        return f'{key}: "{_mask_token(value)}"'
+    text = _JSON_FIELD_RE.sub(_redact_json, text)
 
     # Authorization headers
     text = _AUTH_HEADER_RE.sub(

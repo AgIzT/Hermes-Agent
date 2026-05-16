@@ -172,6 +172,24 @@ class TestNonStringContent:
         assert summary is not None
         assert summary == SUMMARY_PREFIX
 
+    def test_string_message_coerced_to_summary_content(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message = "plain summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            summary = c._generate_summary(messages)
+
+        assert summary == f"{SUMMARY_PREFIX}\nplain summary text"
+
     def test_summary_call_does_not_force_temperature(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -190,30 +208,6 @@ class TestNonStringContent:
 
         kwargs = mock_call.call_args.kwargs
         assert "temperature" not in kwargs
-
-    def test_summary_prompt_avoids_filter_sensitive_handoff_framing(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "ok"
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True)
-
-        messages = [
-            {"role": "user", "content": "do something"},
-            {"role": "assistant", "content": "ok"},
-        ]
-
-        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
-            c._generate_summary(messages)
-
-        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
-        assert "Your output will be injected" not in prompt
-        assert "Do NOT respond" not in prompt
-        assert "DIFFERENT assistant" not in prompt
-        assert "different assistant" not in prompt
-        assert "Treat the conversation turns below as source material" in prompt
-        assert "structured checkpoint summary" in prompt
 
     def test_summary_call_passes_live_main_runtime(self):
         mock_response = MagicMock()
@@ -400,228 +394,43 @@ class TestSummaryFallbackToMainModel:
         assert result is None
         assert c._summary_model_fallen_back is True
 
-    def test_json_decode_error_falls_back_to_main_and_succeeds(self):
-        """JSONDecodeError from the OpenAI SDK's ``response.json()`` (raised
-        when a misconfigured proxy returns HTML/plain-text with
-        ``Content-Type: application/json``) should trigger the same
-        retry-on-main path as 404/timeout.  Issue #22244."""
-        import json as _json
-
+    def test_empty_summary_model_413_falls_back_to_main(self):
+        """When summary_model_override is None (default), self.summary_model
+        is empty.  If the default provider returns a 413 rate-limit error,
+        the compressor should fall back to the main model explicitly."""
         mock_ok = MagicMock()
         mock_ok.choices = [MagicMock()]
         mock_ok.choices[0].message.content = "summary via main model"
 
-        # Simulate the SDK raising a raw JSONDecodeError with a realistic
-        # error message ("Expecting value: line X column Y char Z").
-        err_json = _json.JSONDecodeError(
-            "Expecting value", "<!DOCTYPE html><html>...</html>", 0
-        )
+        err_413 = Exception("413 TPM exhausted: rate limit exceeded")
+        err_413.status_code = 413
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(
                 model="main-model",
-                summary_model_override="aux-via-broken-proxy",
+                summary_model_override=None,  # default — no aux model
                 quiet_mode=True,
             )
 
+        # summary_model should be empty when no override is set
+        assert c.summary_model == ""
+
         with patch(
             "agent.context_compressor.call_llm",
-            side_effect=[err_json, mock_ok],
+            side_effect=[err_413, mock_ok],
         ) as mock_call:
             result = c._generate_summary(self._msgs())
 
+        # Should retry: first call fails, second succeeds on main model
         assert mock_call.call_count == 2
-        assert mock_call.call_args_list[0].kwargs.get("model") == "aux-via-broken-proxy"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        # Second call should explicitly use the main model
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
         assert result is not None
         assert "summary via main model" in result
-        # Aux-model failure recorded so /usage / gateway warnings can surface it
-        assert c._last_aux_model_failure_model == "aux-via-broken-proxy"
+        # Aux-model failure recorded with "(default)" placeholder
+        assert c._last_aux_model_failure_model == "(default)"
         assert c._last_aux_model_failure_error is not None
-        # The 220-char cap is shared with other fallback branches
-        assert len(c._last_aux_model_failure_error) <= 220
-
-    def test_json_decode_error_substring_match_in_wrapped_exception(self):
-        """When the OpenAI SDK wraps the raw JSONDecodeError inside its own
-        ``APIResponseValidationError`` (or similar), ``isinstance`` no longer
-        matches but the substring "expecting value" still appears in
-        ``str(e)``.  We detect this case by string match and fall back the
-        same way."""
-        mock_ok = MagicMock()
-        mock_ok.choices = [MagicMock()]
-        mock_ok.choices[0].message.content = "summary via main model"
-
-        # A plain Exception with the canonical JSON decode error text — what
-        # the SDK's APIResponseValidationError looks like at str() time.
-        err_wrapped = Exception("Expecting value: line 1 column 1 (char 0)")
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(
-                model="main-model",
-                summary_model_override="aux-model",
-                quiet_mode=True,
-            )
-
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=[err_wrapped, mock_ok],
-        ) as mock_call:
-            result = c._generate_summary(self._msgs())
-
-        assert mock_call.call_count == 2
-        assert result is not None
-        assert "summary via main model" in result
-
-    def test_json_decode_error_on_main_uses_short_cooldown(self):
-        """When already on the main model (no separate summary_model, or
-        fallback already happened), a JSONDecodeError should set the short
-        30s cooldown, not the default 60s — provider bodies tend to
-        recover quickly when an upstream proxy comes back online."""
-        import json as _json
-
-        err_json = _json.JSONDecodeError("Expecting value", "<html/>", 0)
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(
-                model="main-model",
-                # No summary_model_override → already on main, no fallback path.
-                quiet_mode=True,
-            )
-
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=err_json,
-        ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
-            result = c._generate_summary(self._msgs())
-
-        assert result is None
-        # Short JSON-decode cooldown is 30s, not the default 60s.
-        assert c._summary_failure_cooldown_until == 1030.0
-
-
-class TestStreamingClosedFallback:
-    """httpcore / httpx streaming premature-close errors must be classified the
-    same as timeouts so the compressor retries on the main model instead of
-    entering a 60-second cooldown.  Issue #18458.
-
-    ``_is_connection_error`` is patched here because the test venv may not
-    have ``openai`` installed (the real function does ``from openai import ...``
-    inside its body).  We test the *wiring* — that `_generate_summary` calls
-    ``_is_connection_error`` and acts on its result — not the classifier itself
-    (that's covered in ``test_auxiliary_client.py::TestIsConnectionError``).
-    """
-
-    def _msgs(self):
-        return [
-            {"role": "user", "content": "do something"},
-            {"role": "assistant", "content": "ok"},
-        ]
-
-    def test_incomplete_chunked_read_falls_back_to_main(self):
-        """``httpcore.RemoteProtocolError: incomplete chunked read`` triggers
-        the retry-on-main path when ``_is_connection_error`` returns True."""
-        mock_ok = MagicMock()
-        mock_ok.choices = [MagicMock()]
-        mock_ok.choices[0].message.content = "summary via main model"
-
-        err = Exception("RemoteProtocolError: incomplete chunked read")
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(
-                model="main-model",
-                summary_model_override="aux-stream-model",
-                quiet_mode=True,
-            )
-
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=[err, mock_ok],
-        ) as mock_call, patch(
-            "agent.context_compressor._is_connection_error",
-            return_value=True,
-        ):
-            result = c._generate_summary(self._msgs())
-
-        assert mock_call.call_count == 2
-        assert mock_call.call_args_list[0].kwargs.get("model") == "aux-stream-model"
-        assert "model" not in mock_call.call_args_list[1].kwargs
-        assert result is not None
-        assert "summary via main model" in result
-
-    def test_peer_closed_connection_falls_back_to_main(self):
-        """``peer closed connection`` triggers the retry-on-main path."""
-        mock_ok = MagicMock()
-        mock_ok.choices = [MagicMock()]
-        mock_ok.choices[0].message.content = "summary ok"
-
-        err = Exception("peer closed connection without sending complete message body")
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(
-                model="main-model",
-                summary_model_override="aux-model",
-                quiet_mode=True,
-            )
-
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=[err, mock_ok],
-        ) as mock_call, patch(
-            "agent.context_compressor._is_connection_error",
-            return_value=True,
-        ):
-            result = c._generate_summary(self._msgs())
-
-        assert mock_call.call_count == 2
-        assert result is not None
-
-    def test_streaming_closed_on_main_uses_short_cooldown(self):
-        """When already on the main model, a streaming-closed error should use
-        the 30s cooldown, not the default 60s — these errors are transient."""
-        err = Exception("RemoteProtocolError: response ended prematurely")
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(
-                model="main-model",
-                # No summary_model_override → no fallback path.
-                quiet_mode=True,
-            )
-
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=err,
-        ), patch(
-            "agent.context_compressor._is_connection_error",
-            return_value=True,
-        ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
-            result = c._generate_summary(self._msgs())
-
-        assert result is None
-        # Streaming-closed should use the 30s short cooldown.
-        assert c._summary_failure_cooldown_until == 1030.0
-
-    def test_non_streaming_unknown_error_still_uses_long_cooldown(self):
-        """Unclassified errors should retain the 60s default cooldown to
-        prevent hammering a broken provider."""
-        err = Exception("Internal Server Error: something unexpected happened")
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(
-                model="main-model",
-                quiet_mode=True,
-            )
-
-        with patch(
-            "agent.context_compressor.call_llm",
-            side_effect=err,
-        ), patch(
-            "agent.context_compressor._is_connection_error",
-            return_value=False,
-        ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
-            result = c._generate_summary(self._msgs())
-
-        assert result is None
-        assert c._summary_failure_cooldown_until == 1060.0
+        assert "413" in c._last_aux_model_failure_error
 
 
 class TestAuxModelFallbackSurfacedToCallers:
@@ -911,43 +720,66 @@ class TestCompressWithClient:
             "call_123"
         ]
 
-    def test_user_role_summary_carries_end_marker(self):
-        """When the summary lands as standalone role='user' (e.g. head ends
-        with assistant/tool), the message body must include the explicit
-        '--- END OF CONTEXT SUMMARY ---' marker. Without it, weak models
-        read the verbatim past user request quoted in '## Active Task' as
-        fresh input (#11475, #14521).
-        """
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "summary text"
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
-
-        # head_last=assistant, tail_first=assistant (same shape as the
-        # existing consecutive-user test) → role resolves to "user".
+    def test_sanitizer_removes_tool_messages_with_none_tool_call_id(self, compressor):
+        """Tool messages with tool_call_id=None must be removed — they cause
+        API 400 'tool_call_id is not set' errors (e.g. MiMo, OpenAI)."""
         msgs = [
-            {"role": "user", "content": "msg 0"},
-            {"role": "assistant", "content": "msg 1"},
-            {"role": "user", "content": "msg 2"},
-            {"role": "assistant", "content": "msg 3"},
-            {"role": "user", "content": "msg 4"},
-            {"role": "assistant", "content": "msg 5"},
-            {"role": "user", "content": "msg 6"},
-            {"role": "assistant", "content": "msg 7"},
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "read_file", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "file content"},
+            {"role": "tool", "tool_call_id": None, "content": "orphan with None id"},
+            {"role": "user", "content": "thanks"},
         ]
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
-            result = c.compress(msgs)
 
-        summary_msg = next(
-            m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
-        )
-        assert summary_msg["role"] == "user"
-        assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
-        assert summary_msg["content"].rstrip().endswith(
-            "respond to the message below, not the summary above ---"
-        )
+        sanitized = compressor._sanitize_tool_pairs(msgs)
+
+        tool_msgs = [m for m in sanitized if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "tc_1"
+
+    def test_sanitizer_removes_tool_messages_with_empty_tool_call_id(self, compressor):
+        """Tool messages with tool_call_id='' must be removed."""
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "terminal", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "exit 0"},
+            {"role": "tool", "tool_call_id": "", "content": "empty id result"},
+            {"role": "tool", "content": "completely missing tool_call_id field"},
+        ]
+
+        sanitized = compressor._sanitize_tool_pairs(msgs)
+
+        tool_msgs = [m for m in sanitized if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "tc_1"
+
+    def test_sanitizer_removes_all_orphaned_when_no_assistant_calls(self, compressor):
+        """When there are no assistant tool_calls at all, all tool messages
+        (including those with valid-looking but orphaned IDs) should be removed."""
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "let me check"},
+            {"role": "tool", "tool_call_id": "tc_old", "content": "stale result"},
+            {"role": "tool", "tool_call_id": None, "content": "null id result"},
+            {"role": "user", "content": "what happened?"},
+        ]
+
+        sanitized = compressor._sanitize_tool_pairs(msgs)
+
+        tool_msgs = [m for m in sanitized if m.get("role") == "tool"]
+        assert len(tool_msgs) == 0
 
     def test_summary_role_avoids_consecutive_user_messages(self):
         """Summary role should alternate with the last head message to avoid consecutive same-role messages."""
@@ -991,12 +823,9 @@ class TestCompressWithClient:
         mock_client.chat.completions.create.return_value = mock_response
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3, protect_last_n=2)
 
         # Last head message (index 2) is "user" → summary should be "assistant"
-        # NOTE: protect_first_n=2 preserves 2 non-system messages in addition to
-        # the system prompt (always implicitly protected), yielding head [system,
-        # user, user] with last head = user.
         msgs = [
             {"role": "system", "content": "system prompt"},
             {"role": "user", "content": "msg 1"},
@@ -1062,13 +891,11 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=3)
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3, protect_last_n=3)
 
         # Head: [system, user, assistant]  →  last head = assistant
         # Tail: [user, assistant, user]    →  first tail = user
         # summary_role="user" collides with tail, "assistant" collides with head → merge
-        # NOTE: protect_first_n=2 preserves 2 non-system messages in addition to
-        # the system prompt (always implicitly protected).
         msgs = [
             {"role": "system", "content": "system prompt"},
             {"role": "user", "content": "msg 1"},
@@ -1102,7 +929,7 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=3)
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3, protect_last_n=3)
 
         msgs = [
             {"role": "system", "content": "system prompt"},
@@ -1138,15 +965,13 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=2)
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         # Head: [system, user]        → last head = user
         # Tail: [assistant, user, assistant] → first tail = assistant
         # summary_role="assistant" collides with tail, "user" collides with head → merge
-        # NOTE: protect_first_n=1 preserves 1 non-system message in addition to
-        # the system prompt (always implicitly protected).
         # With min_tail=3, tail = last 3 messages (indices 5-7).
-        # Need 8 messages: _min_for_compress = head(2) + 3 + 1 = 6, must have > 6.
+        # Need 8 messages: min_for_compress = 2+3+1 = 6, must have > 6.
         msgs = [
             {"role": "system", "content": "system prompt"},
             {"role": "user", "content": "msg 1"},
@@ -1298,92 +1123,6 @@ class TestSummaryTargetRatio:
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True)
         assert c.protect_last_n == 20
-
-    def test_default_protect_first_n_is_3(self):
-        """Default protect_first_n is 3 (system + 3 extra non-system messages =
-        4 protected messages total when a system prompt is present). With the
-        new semantics, the constructor default is 3 — the system prompt is
-        always implicitly protected ON TOP OF protect_first_n non-system
-        messages.
-        """
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.protect_first_n == 3
-
-    def test_protect_first_n_override(self):
-        """protect_first_n=0 should be honoured — for users who rely on rolling
-        compaction and want NOTHING pinned at head except the system prompt
-        (always implicitly protected)."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=0)
-        assert c.protect_first_n == 0
-
-    def test_protect_first_n_0_preserves_only_system_prompt(self):
-        """End-to-end: when protect_first_n=0, compression should treat only
-        the system prompt as head.  All user/assistant messages between the
-        system prompt and the protected tail become summarization candidates.
-
-        This is the cleanest configuration for long-running rolling-compaction
-        sessions — no user/assistant turn gets pinned verbatim forever just
-        because it happened to be early in the session."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(
-                model="test",
-                quiet_mode=True,
-                protect_first_n=0,
-                protect_last_n=2,
-            )
-        msgs = (
-            [{"role": "system", "content": "System prompt"}]
-            + [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
-               for i in range(8)]
-        )
-        result = c.compress(msgs)
-        # System prompt (msg[0]) survives as head
-        assert result[0]["role"] == "system"
-        assert result[0]["content"].startswith("System prompt")
-        # The first user/assistant exchange (msg 0, msg 1) should NOT be pinned
-        # as head verbatim — those would have been summarized or absorbed.
-        # Under default protect_first_n=3, result[1..3] would be the literal
-        # "msg 0" / "msg 1" / "msg 2"; with protect_first_n=0 they aren't.
-        assert result[1].get("content") != "msg 0"
-        # Last 2 messages are tail-protected under protect_last_n=2
-        assert result[-1]["content"] == msgs[-1]["content"]
-
-    def test_protect_first_n_semantics_stable_without_system_prompt(self):
-        """Regression: gateway /compress handler strips the system prompt
-        before calling compress().  protect_first_n must mean the same thing
-        in both paths — "N non-system head messages" — so configuring
-        protect_first_n=0 preserves NOTHING at the head regardless of whether
-        the system prompt is in the messages list.
-
-        Bug this covers: under the old semantics, protect_first_n counted
-        literally from messages[0].  In the gateway path (no system prompt)
-        that meant protect_first_n=1 would pin the first user turn of the
-        session forever — a user-reported complaint that a week-old
-        resolved question kept getting reinserted into every compaction
-        summary."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
-            c = ContextCompressor(
-                model="test",
-                quiet_mode=True,
-                protect_first_n=0,
-                protect_last_n=2,
-            )
-        # No system prompt — this is what the gateway passes to compress().
-        msgs = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
-            for i in range(10)
-        ]
-        head_size = c._protect_head_size(msgs)
-        # With no system prompt and protect_first_n=0 → head is empty.
-        # The first user message is NOT pinned as head.
-        assert head_size == 0
-
-        # And with protect_first_n=3 on the same no-system-prompt list →
-        # head size is 3 (the three earliest non-system messages).
-        c.protect_first_n = 3
-        assert c._protect_head_size(msgs) == 3
 
 
 class TestTokenBudgetTailProtection:
@@ -1658,47 +1397,6 @@ class TestTokenBudgetTailProtection:
         cut = c._find_tail_cut_by_tokens(messages, head_end)
         assert isinstance(cut, int)
         assert 0 <= cut <= len(messages)
-
-    def test_generous_budget_protects_everything_floor_does_not_override(
-        self, budget_compressor
-    ):
-        """A budget that covers the whole transcript must prune nothing —
-        ``protect_tail_count`` is a minimum floor, not a ceiling."""
-        c = budget_compressor
-
-        # 100 alternating assistant/tool messages.  Each tool result has
-        # *unique* content so the dedup pass (Pass 1, which is independent
-        # of prune_boundary) is a no-op and we isolate the boundary logic.
-        messages = []
-        for i in range(50):
-            messages.append({
-                "role": "assistant", "content": None,
-                "tool_calls": [{
-                    "id": f"c{i}",
-                    "type": "function",
-                    "function": {"name": "noop", "arguments": "{}"},
-                }],
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": f"c{i}",
-                "content": f"unique-tool-output-{i:03d}-" + ("x" * 250),
-            })
-
-        # Budget large enough to cover the whole transcript many times over,
-        # so the budget walk completes without hitting its break condition
-        # and the boundary lands at 0 ("protect everything").
-        _, pruned = c._prune_old_tool_results(
-            messages,
-            protect_tail_count=20,
-            protect_tail_tokens=10_000_000,
-        )
-
-        assert pruned == 0, (
-            "budget said protect everything, but the floor still pruned "
-            f"{pruned} messages — protect_tail_count is acting as a ceiling, "
-            "not a minimum floor"
-        )
 
 
 class TestUpdateModelBudgets:

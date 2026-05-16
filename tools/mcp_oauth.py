@@ -79,6 +79,27 @@ except ImportError:
 # Exceptions
 # ---------------------------------------------------------------------------
 
+def _secure_dir_safe(d: Path) -> None:
+    """chmod 0o700 a dir if and only if it's safe to do so.
+
+    Avoids bricking the host if *d* resolves to ``/`` or another critical
+    system directory (e.g. when ``path.parent`` is empty / relative and
+    ``.resolve()`` lands on ``/``).
+    """
+    d = d.resolve()
+    if d == Path("/") or d == Path(d.anchor) or len(d.parts) < 2:
+        return
+    _critical = frozenset(
+        {Path("/etc"), Path("/var"), Path("/usr"), Path("/home"),
+         Path("/root"), Path("/opt"), Path("/tmp")}
+    )
+    if d in _critical:
+        return
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+
 
 class OAuthNonInteractiveError(RuntimeError):
     """Raised when OAuth requires browser interaction in a non-interactive env."""
@@ -174,11 +195,7 @@ def _write_json(path: Path, data: dict) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to the creds.
-    # No-op on Windows (POSIX mode bits aren't enforced); ignore failures.
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
+    _secure_dir_safe(path.parent)
     # Per-process random suffix avoids collisions between concurrent
     # writers and stale leftovers from a prior crashed write.
     tmp = path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")

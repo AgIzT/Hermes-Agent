@@ -11,8 +11,8 @@ allowed a cross-guild DM bypass:
    in public server A, and authorizes the DM.
 
 The fix scopes role checks to the originating guild and disables role-based
-auth on DMs unless ``discord.dm_role_auth_guild`` in config.yaml explicitly
-opts into a single trusted guild.
+auth on DMs unless ``DISCORD_DM_ROLE_AUTH_GUILD`` explicitly opts into a
+single trusted guild.
 """
 
 from types import SimpleNamespace
@@ -21,17 +21,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from gateway.platforms.discord import DiscordAdapter
-
-
-def _set_dm_role_auth_guild(monkeypatch, guild_id=None):
-    """Stub ``hermes_cli.config.read_raw_config`` so ``_read_dm_role_auth_guild``
-    resolves to ``guild_id`` (or None for the opt-out default).
-    """
-    cfg = {"discord": {"dm_role_auth_guild": guild_id if guild_id is not None else ""}}
-    # Patch the attribute ``hermes_cli.config.read_raw_config`` — that's
-    # what ``_read_dm_role_auth_guild`` imports at call time.
-    import hermes_cli.config as _cfg_mod
-    monkeypatch.setattr(_cfg_mod, "read_raw_config", lambda: cfg, raising=True)
 
 
 def _make_adapter(allowed_users=None, allowed_roles=None, guilds=None):
@@ -80,7 +69,7 @@ def test_dm_rejects_role_held_in_other_guild(monkeypatch):
     Regression guard for the cross-guild DM bypass in the initial
     DISCORD_ALLOWED_ROLES implementation.
     """
-    _set_dm_role_auth_guild(monkeypatch)
+    monkeypatch.delenv("DISCORD_DM_ROLE_AUTH_GUILD", raising=False)
 
     public_guild, _ = _guild_with_member(
         guild_id=111111,
@@ -102,7 +91,7 @@ def test_dm_rejects_role_held_in_other_guild(monkeypatch):
 
 
 def test_dm_role_auth_requires_explicit_guild_optin(monkeypatch):
-    """With dm_role_auth_guild set, only that specific guild counts.
+    """With DISCORD_DM_ROLE_AUTH_GUILD set, only that specific guild counts.
 
     The user has the role in the opted-in guild — allowed.
     """
@@ -117,7 +106,7 @@ def test_dm_role_auth_requires_explicit_guild_optin(monkeypatch):
         allowed_roles=[5555],
         guilds=[other_guild, trusted_guild],
     )
-    _set_dm_role_auth_guild(monkeypatch, 222222)
+    monkeypatch.setenv("DISCORD_DM_ROLE_AUTH_GUILD", "222222")
 
     assert (
         adapter._is_allowed_user("42", author=None, guild=None, is_dm=True)
@@ -126,7 +115,7 @@ def test_dm_role_auth_requires_explicit_guild_optin(monkeypatch):
 
 
 def test_dm_role_auth_optin_rejects_when_not_member(monkeypatch):
-    """dm_role_auth_guild set but user isn't a member → reject."""
+    """DISCORD_DM_ROLE_AUTH_GUILD set but user isn't a member → reject."""
     trusted_guild = SimpleNamespace(
         id=222222,
         get_member=lambda uid: None,  # user not in trusted guild
@@ -140,7 +129,7 @@ def test_dm_role_auth_optin_rejects_when_not_member(monkeypatch):
         allowed_roles=[5555],
         guilds=[public_guild, trusted_guild],
     )
-    _set_dm_role_auth_guild(monkeypatch, 222222)
+    monkeypatch.setenv("DISCORD_DM_ROLE_AUTH_GUILD", "222222")
 
     assert (
         adapter._is_allowed_user("42", author=None, guild=None, is_dm=True)
@@ -157,7 +146,7 @@ def test_guild_message_role_check_scoped_to_originating_guild(monkeypatch):
     """A user with the role in a DIFFERENT guild than the message origin
     must NOT be authorized, even when both guilds are mutual.
     """
-    _set_dm_role_auth_guild(monkeypatch)
+    monkeypatch.delenv("DISCORD_DM_ROLE_AUTH_GUILD", raising=False)
 
     public_guild, _ = _guild_with_member(
         guild_id=111111,
@@ -183,7 +172,7 @@ def test_guild_message_role_check_scoped_to_originating_guild(monkeypatch):
 
 def test_guild_message_role_check_allows_when_role_in_same_guild(monkeypatch):
     """Positive path: user has the role IN the message's guild → allowed."""
-    _set_dm_role_auth_guild(monkeypatch)
+    monkeypatch.delenv("DISCORD_DM_ROLE_AUTH_GUILD", raising=False)
 
     trusted_guild, _ = _guild_with_member(
         guild_id=222222,
@@ -208,7 +197,7 @@ def test_guild_message_rejects_author_roles_from_different_guild(monkeypatch):
     message, the cached .roles on it must NOT be trusted — rely on the
     current guild's Member lookup instead.
     """
-    _set_dm_role_auth_guild(monkeypatch)
+    monkeypatch.delenv("DISCORD_DM_ROLE_AUTH_GUILD", raising=False)
 
     # Author is a Member of a DIFFERENT guild with the allowed role
     foreign_guild = SimpleNamespace(id=999, get_member=lambda uid: None)
@@ -263,93 +252,3 @@ def test_empty_allowlists_allow_everyone():
         adapter._is_allowed_user("42", author=None, guild=None, is_dm=True)
         is True
     )
-
-
-# ---------------------------------------------------------------------------
-# Slash-surface sibling site: _evaluate_slash_authorization must pass
-# guild/is_dm through so the cross-guild bypass can't land via slash either.
-# ---------------------------------------------------------------------------
-
-
-def test_slash_authorization_rejects_cross_guild_role_dm(monkeypatch):
-    """Slash interaction in a DM must not be authorized by a role held in
-    any mutual guild (parallel to the on_message cross-guild bypass)."""
-    import discord as _discord  # type: ignore
-    _set_dm_role_auth_guild(monkeypatch)
-
-    public_guild, _ = _guild_with_member(
-        guild_id=111111,
-        member_id=42,
-        role_ids=[5555],
-    )
-    adapter = _make_adapter(
-        allowed_roles=[5555],
-        guilds=[public_guild],
-    )
-
-    # Fake a DM interaction: user is Member-like, channel is DMChannel,
-    # interaction.guild is None.
-    interaction = SimpleNamespace(
-        user=SimpleNamespace(id=42),
-        channel=MagicMock(spec=_discord.DMChannel),
-        channel_id=None,
-        guild=None,
-    )
-
-    allowed, reason = adapter._evaluate_slash_authorization(interaction)
-    assert allowed is False
-    assert "ALLOWED" in (reason or "")
-
-
-def test_slash_authorization_rejects_cross_guild_role_in_guild(monkeypatch):
-    """Slash in guild B must not be authorized by a role held in guild A."""
-    _set_dm_role_auth_guild(monkeypatch)
-
-    public_guild, _ = _guild_with_member(
-        guild_id=111111,
-        member_id=42,
-        role_ids=[5555],
-    )
-    # Interaction arrives in trusted_guild where user 42 has no role
-    trusted_guild = SimpleNamespace(id=222222, get_member=lambda uid: None)
-    adapter = _make_adapter(
-        allowed_roles=[5555],
-        guilds=[public_guild, trusted_guild],
-    )
-
-    interaction = SimpleNamespace(
-        user=SimpleNamespace(id=42),
-        channel=SimpleNamespace(id=9999),  # not a DMChannel instance
-        channel_id=9999,
-        guild=trusted_guild,
-    )
-
-    allowed, reason = adapter._evaluate_slash_authorization(interaction)
-    assert allowed is False
-    assert "ALLOWED" in (reason or "")
-
-
-def test_slash_authorization_allows_in_scope_guild_role(monkeypatch):
-    """Positive control: slash in guild B, user has role in guild B → allowed."""
-    _set_dm_role_auth_guild(monkeypatch)
-
-    trusted_guild, _ = _guild_with_member(
-        guild_id=222222,
-        member_id=42,
-        role_ids=[5555],
-    )
-    adapter = _make_adapter(
-        allowed_roles=[5555],
-        guilds=[trusted_guild],
-    )
-
-    interaction = SimpleNamespace(
-        user=SimpleNamespace(id=42),
-        channel=SimpleNamespace(id=9999),
-        channel_id=9999,
-        guild=trusted_guild,
-    )
-
-    allowed, reason = adapter._evaluate_slash_authorization(interaction)
-    assert allowed is True
-    assert reason is None

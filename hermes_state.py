@@ -1168,6 +1168,7 @@ class SessionDB:
         include_children: bool = False,
         project_compression_tips: bool = True,
         order_by_last_active: bool = False,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -1220,6 +1221,10 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+
+        if user_id:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         if order_by_last_active:
@@ -1885,6 +1890,7 @@ class SessionDB:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1923,6 +1929,10 @@ class SessionDB:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+
+        if user_id:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
@@ -1996,6 +2006,9 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if user_id:
+                    tri_where.append("s.user_id = ?")
+                    tri_params.append(user_id)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -2051,6 +2064,9 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if user_id:
+                    like_where.append("s.user_id = ?")
+                    like_params.append(user_id)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -2153,6 +2169,7 @@ class SessionDB:
         source: str = None,
         limit: int = 20,
         offset: int = 0,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions, optionally filtered by source.
 
@@ -2169,12 +2186,26 @@ class SessionDB:
             ") m ON m.session_id = s.id "
         )
         with self._lock:
-            if source:
+            if source and user_id:
+                cursor = self._conn.execute(
+                    f"{select_with_last_active}"
+                    "WHERE s.source = ? AND s.user_id = ? "
+                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
+                    (source, user_id, limit, offset),
+                )
+            elif source:
                 cursor = self._conn.execute(
                     f"{select_with_last_active}"
                     "WHERE s.source = ? "
                     "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
                     (source, limit, offset),
+                )
+            elif user_id:
+                cursor = self._conn.execute(
+                    f"{select_with_last_active}"
+                    "WHERE s.user_id = ? "
+                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
+                    (user_id, limit, offset),
                 )
             else:
                 cursor = self._conn.execute(

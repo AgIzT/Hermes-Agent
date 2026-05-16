@@ -829,6 +829,12 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
     Cache key is ``model@base_url`` so the same model name served from
     different providers can have different limits.
     """
+    if length <= 0:
+        logger.warning(
+            "Refusing to cache context_length=%s for %s@%s (non-positive)",
+            length, model, base_url,
+        )
+        return
     key = f"{model}@{base_url}"
     cache = _load_context_cache()
     if cache.get(key) == length:
@@ -1489,7 +1495,14 @@ def get_model_context_length(
             # slug, so any cached Codex entry at or above 400K is a leftover
             # from the old resolution path. Drop it and fall through to the
             # live /models probe in step 5 below.
-            if provider == "openai-codex" and cached >= 400_000:
+            if cached <= 0:
+                logger.warning(
+                    "Dropping non-positive cached context_length=%s for %s@%s; "
+                    "re-resolving",
+                    cached, model, base_url,
+                )
+                _invalidate_cached_context_length(model, base_url)
+            elif provider == "openai-codex" and cached >= 400_000:
                 logger.info(
                     "Dropping stale Codex cache entry %s@%s -> %s (pre-fix value); "
                     "re-resolving via live /models probe",

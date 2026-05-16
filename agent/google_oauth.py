@@ -64,6 +64,28 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 
+def _secure_dir_safe(d: Path) -> None:
+    """chmod 0o700 a dir if and only if it's safe to do so.
+
+    Avoids bricking the host if *d* resolves to ``/`` or another critical
+    system directory (e.g. when ``path.parent`` is empty / relative and
+    ``.resolve()`` lands on ``/``).
+    """
+    d = d.resolve()
+    if d == Path("/") or d == Path(d.anchor) or len(d.parts) < 2:
+        return
+    _critical = frozenset(
+        {Path("/etc"), Path("/var"), Path("/usr"), Path("/home"),
+         Path("/root"), Path("/opt"), Path("/tmp")}
+    )
+    if d in _critical:
+        return
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+
+
 # =============================================================================
 # OAuth client credential resolution.
 #
@@ -490,11 +512,7 @@ def save_credentials(creds: GoogleCredentials) -> Path:
     path = _credentials_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to the creds file.
-    # On Windows this is a no-op (POSIX mode bits aren't enforced); ignore failures.
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
+    _secure_dir_safe(path.parent)
     payload = json.dumps(creds.to_dict(), indent=2, sort_keys=True) + "\n"
 
     with _credentials_lock():

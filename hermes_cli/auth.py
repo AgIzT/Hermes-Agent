@@ -56,6 +56,33 @@ try:
 except Exception:
     msvcrt = None
 
+# ---------------------------------------------------------------------------
+# Security helpers
+# ---------------------------------------------------------------------------
+
+
+def _secure_dir_safe(d: Path) -> None:
+    """chmod 0o700 a dir if and only if it's safe to do so.
+
+    Avoids bricking the host if *d* resolves to ``/`` or another critical
+    system directory (e.g. when ``path.parent`` is empty / relative and
+    ``.resolve()`` lands on ``/``).
+    """
+    d = d.resolve()
+    if d == Path("/") or d == Path(d.anchor) or len(d.parts) < 2:
+        return
+    _critical = frozenset(
+        {Path("/etc"), Path("/var"), Path("/usr"), Path("/home"),
+         Path("/root"), Path("/opt"), Path("/tmp")}
+    )
+    if d in _critical:
+        return
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+
+
 # =============================================================================
 # Constants
 # =============================================================================
@@ -279,7 +306,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         name="Anthropic",
         auth_type="api_key",
         inference_base_url="https://api.anthropic.com",
-        api_key_env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+        api_key_env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN"),
         base_url_env_var="ANTHROPIC_BASE_URL",
     ),
     "alibaba": ProviderConfig(
@@ -986,11 +1013,7 @@ def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
     auth_file = _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
-    # No-op on Windows (POSIX mode bits not enforced); ignore failures.
-    try:
-        os.chmod(auth_file.parent, 0o700)
-    except OSError:
-        pass
+    _secure_dir_safe(auth_file.parent)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
@@ -1569,10 +1592,7 @@ def _read_qwen_cli_tokens() -> Dict[str, Any]:
 def _save_qwen_cli_tokens(tokens: Dict[str, Any]) -> Path:
     auth_path = _qwen_cli_auth_path()
     auth_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(auth_path.parent, 0o700)
-    except OSError:
-        pass
+    _secure_dir_safe(auth_path.parent)
     # Per-process random temp suffix avoids collisions between concurrent
     # writers and stale leftovers from a crashed prior write.
     tmp_path = auth_path.with_name(f"{auth_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
@@ -2987,10 +3007,7 @@ def _write_shared_nous_state(state: Dict[str, Any]) -> None:
         with _nous_shared_store_lock():
             path = _nous_shared_store_path()
             path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.chmod(path.parent, 0o700)
-            except OSError:
-                pass
+            _secure_dir_safe(path.parent)
             tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
             # Create with 0o600 atomically via os.open(O_EXCL) — closes the TOCTOU
             # window where write_text() + post-write chmod briefly exposed Nous

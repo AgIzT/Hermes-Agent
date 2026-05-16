@@ -26,7 +26,7 @@
 - `agent/hybrid_skill_selector.py`
 - `plugins/skill-enforcer/`
 
-大概包括：
+包括：
 
 - 安全边界增强：secret redaction、SSRF、防敏感文件读写、防路径穿越等。
 - memory/session 相关修复：多用户隔离、CJK/session search 等。
@@ -34,21 +34,13 @@
 - memory metacognition / preflight policy。
 - 一些 custom provider、credential pool、gateway 兼容修复。
 
-## 我的网关配置
+## 网关配置
 
 实际运行配置在本机 Hermes home，不提交到这个 repo：
 
 ```text
-D:\program\hermes\config.yaml
+\hermes\config.yaml
 ```
-
-关键点：
-
-- 模型：`gpt-5.5`
-- provider：`custom`
-- API 模式：`codex_responses`
-- reasoning effort：`xhigh`
-- 真实 `base_url` 和 `api_key` 只放本机配置里，不写进仓库。
 
 ## /v1/responses 兼容记录
 
@@ -69,22 +61,18 @@ D:\program\hermes\config.yaml
 这些文件在本机 Hermes home 里，不属于源码 repo：
 
 ```text
-D:\program\hermes\LOCAL_CHANGES.md
-D:\program\hermes\memory_policy.yaml
-D:\program\hermes\config.yaml
-D:\program\hermes\auth.json
+\hermes\LOCAL_CHANGES.md
+\hermes\memory_policy.yaml
+\hermes\config.yaml
+\hermes\auth.json
 ```
 
 其中：
 
 - `LOCAL_CHANGES.md` 是更详细的本机维护笔记。
 - `memory_policy.yaml` 是从社区补丁复制出来的运行配置。
-- `config.yaml` 里有真实 API key，不能提交。
-- `auth.json` 里有认证信息，不能提交。
 
 ## 端口记录
-
-当前需要记住的端口：
 
 - `9177`：memory metacognition / hindsight API，配置在 `memory_policy.yaml`
 - `9119`：Hermes web dashboard 默认端口
@@ -94,10 +82,9 @@ D:\program\hermes\auth.json
 
 当前 `config.yaml` 没有显式写 API server/webhook 端口，上面这些主要是 Hermes 默认值和社区补丁配置值。
 
-## 更新前看一眼
+## 更新前
 
-- 不要把 `config.yaml`、`auth.json`、`.env`、真实 key 提交上来。
 - 重新套补丁前先做 `git apply --check`。
 - 更新后确认 custom `codex_responses` 的 `User-Agent` 修复还在。
-- `memory_policy.yaml` 在本机 Hermes home 里，源码更新不会自动带上。
+- `memory_policy.yaml` 在本机 Hermes home 里。
 

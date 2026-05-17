@@ -39,11 +39,29 @@ _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 # exfiltrating arbitrary host files via the media delivery pipeline.
 # ---------------------------------------------------------------------------
 
-# Directories whose resolved contents may be served as media attachments.
-# Platform adapters populate this at startup (e.g. cache dirs for images,
-# audio, screenshots).  The security boundary is enforced by
-# ``_is_authorized_media_path()``.
+# Directories whose resolved contents may be served as MEDIA: attachments.
+# Hermes cache dirs are registered after their constants are defined. Personal
+# installs may add narrow extra roots with HERMES_MEDIA_ALLOWED_DIRS.
 _AUTHORIZED_MEDIA_DIRS: tuple = ()
+
+
+def _extra_authorized_media_dirs() -> tuple:
+    """Return optional user-configured media roots.
+
+    Values are separated with semicolons, commas, or newlines. Semicolons are
+    the friendliest choice on Windows because drive letters contain colons.
+    """
+    raw = os.getenv("HERMES_MEDIA_ALLOWED_DIRS") or os.getenv("HERMES_ALLOWED_MEDIA_DIRS") or ""
+    dirs = []
+    for item in re.split(r"[;,\n]+", raw):
+        item = item.strip().strip('"').strip("'")
+        if not item:
+            continue
+        try:
+            dirs.append(Path(item).expanduser().resolve())
+        except (OSError, ValueError):
+            continue
+    return tuple(dirs)
 
 
 def _is_authorized_media_path(path: str) -> bool:
@@ -67,12 +85,14 @@ def _is_authorized_media_path(path: str) -> bool:
         return False
     if not resolved.is_absolute():
         return False
-    for allowed_dir in _AUTHORIZED_MEDIA_DIRS:
+    for allowed_dir in (*_AUTHORIZED_MEDIA_DIRS, *_extra_authorized_media_dirs()):
         try:
-            # Path.is_relative_to() is Python 3.9+
-            if resolved == allowed_dir or str(resolved).startswith(str(allowed_dir) + os.sep):
+            allowed = Path(allowed_dir).resolve()
+            resolved_s = os.path.normcase(str(resolved))
+            allowed_s = os.path.normcase(str(allowed))
+            if resolved_s == allowed_s or resolved_s.startswith(allowed_s + os.sep):
                 return True
-        except (TypeError, AttributeError):
+        except (OSError, TypeError, AttributeError, ValueError):
             continue
     return False
 
@@ -808,6 +828,20 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
 # ---------------------------------------------------------------------------
 
 DOCUMENT_CACHE_DIR = get_hermes_dir("cache/documents", "document_cache")
+SCREENSHOT_CACHE_DIR = get_hermes_dir("cache/screenshots", "browser_screenshots")
+LEGACY_MEDIA_CACHE_DIR = get_hermes_dir("media_cache", "media_cache")
+
+_AUTHORIZED_MEDIA_DIRS = tuple(
+    p.resolve()
+    for p in (
+        IMAGE_CACHE_DIR,
+        AUDIO_CACHE_DIR,
+        VIDEO_CACHE_DIR,
+        DOCUMENT_CACHE_DIR,
+        SCREENSHOT_CACHE_DIR,
+        LEGACY_MEDIA_CACHE_DIR,
+    )
+)
 
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf",
@@ -1915,20 +1949,8 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def _is_safe_media_path(path: str) -> bool:
-        """Validate that a MEDIA: path is within the Hermes cache directory.
-
-        Rejects absolute paths, parent-directory traversal, and paths outside
-        the designated media cache to prevent arbitrary file reads via prompt
-        injection.
-        """
-        cache_dir = os.path.realpath(os.path.join(
-            os.path.expanduser("~"), ".hermes", "media_cache"
-        ))
-        try:
-            resolved = os.path.realpath(os.path.expanduser(path))
-        except (ValueError, OSError):
-            return False
-        return resolved.startswith(cache_dir + os.sep) or resolved == cache_dir
+        """Backward-compatible wrapper for MEDIA: path authorization."""
+        return _is_authorized_media_path(path)
 
     @staticmethod
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
@@ -1962,11 +1984,11 @@ class BasePlatformAdapter(ABC):
             if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
                 path = path[1:-1].strip()
             path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
-            if path and _is_safe_media_path(path):
+            if path and _is_authorized_media_path(path):
                 media.append((os.path.expanduser(path), has_voice_tag))
 
         # Remove MEDIA tags from content (including surrounding quote/backtick wrappers)
-        if media:
+        if "MEDIA:" in content:
             cleaned = media_pattern.sub('', cleaned)
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
@@ -1977,10 +1999,9 @@ class BasePlatformAdapter(ABC):
         """
         Detect bare local file paths in response text for native media delivery.
 
-        Matches absolute paths (/...) and tilde paths (~/) ending in common
-        image or video extensions.  Validates each candidate with
-        ``os.path.isfile()`` to avoid false positives from URLs or
-        non-existent paths.
+        Matches absolute paths, Windows drive-letter paths, and tilde paths
+        ending in common media/document extensions. Validates each candidate
+        with ``os.path.isfile()`` and ``_is_authorized_media_path()``.
 
         Paths inside fenced code blocks (``` ... ```) and inline code
         (`...`) are ignored so that code samples are never mutilated.
@@ -1992,14 +2013,20 @@ class BasePlatformAdapter(ABC):
         _LOCAL_MEDIA_EXTS = (
             '.png', '.jpg', '.jpeg', '.gif', '.webp',
             '.mp4', '.mov', '.avi', '.mkv', '.webm',
+            '.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac',
+            '.epub', '.pdf', '.zip', '.rar', '.7z',
+            '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+            '.txt', '.csv', '.apk', '.ipa',
         )
         ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
 
         # (?<![/:\w.]) prevents matching inside URLs (e.g. https://…/img.png)
         #             and relative paths (./foo.png)
-        # (?:~/|/)    anchors to absolute or home-relative paths
+        # (?:~/|/|[A-Za-z]:[\\/]) anchors to absolute or home-relative paths
         path_re = re.compile(
-            r'(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:' + ext_part + r')\b',
+            r'(?<![/:\w.])(?:~/|/|[A-Za-z]:[\\/])'
+            r'(?:[^`"\n<>|?*]+?[/\\])*'
+            r'[^`"\n<>|?*]+?\.(?:' + ext_part + r')(?=\s|$|[.,;:)\]}])',
             re.IGNORECASE,
         )
 
@@ -2019,7 +2046,7 @@ class BasePlatformAdapter(ABC):
                 continue
             raw = match.group(0)
             expanded = os.path.expanduser(raw)
-            if os.path.isfile(expanded):
+            if os.path.isfile(expanded) and _is_authorized_media_path(expanded):
                 found.append((raw, expanded))
 
         # Deduplicate by expanded path, preserving discovery order

@@ -1357,6 +1357,83 @@ def _current_custom_base_url() -> str:
     return custom_base or ""
 
 
+
+def _matching_custom_provider_headers(base_url: str) -> Dict[str, str]:
+    """Return headers from the saved custom provider matching ``base_url``.
+
+    The main `model.provider: custom` path stores the active endpoint in the
+    model section, while browser-like headers may live on a matching
+    `custom_providers` entry.  Auxiliary clients are constructed independently
+    from the main agent, so copy those headers here when the endpoint matches.
+    """
+    try:
+        from hermes_cli.config import load_config
+    except Exception:
+        return {}
+
+    def _norm(value: str) -> str:
+        return str(value or "").strip().rstrip("/")
+
+    def _variants(value: str) -> set[str]:
+        normalized = _norm(value)
+        if not normalized:
+            return set()
+        variants = {normalized}
+        if normalized.endswith("/v1"):
+            variants.add(normalized[:-3])
+        else:
+            variants.add(normalized + "/v1")
+        return variants
+
+    target = _norm(base_url)
+    if not target:
+        return {}
+    target_variants = _variants(target) | _variants(_to_openai_base_url(target))
+
+    try:
+        config = load_config()
+        providers = config.get("custom_providers")
+        if not isinstance(providers, list):
+            providers = []
+        # Also support the newer providers: mapping shape.
+        user_providers = config.get("providers")
+        if isinstance(user_providers, dict):
+            for name, entry in user_providers.items():
+                if isinstance(entry, dict):
+                    merged = dict(entry)
+                    merged.setdefault("name", name)
+                    if "base_url" not in merged:
+                        merged["base_url"] = merged.get("api") or merged.get("url")
+                    providers.append(merged)
+    except Exception:
+        return {}
+
+    for entry in providers or []:
+        if not isinstance(entry, dict):
+            continue
+        entry_base = _norm(entry.get("base_url"))
+        if not entry_base:
+            continue
+        entry_variants = _variants(entry_base) | _variants(_to_openai_base_url(entry_base))
+        if not (target_variants & entry_variants):
+            continue
+        headers = entry.get("headers")
+        if not isinstance(headers, dict):
+            return {}
+        normalized = {
+            str(k).strip(): str(v)
+            for k, v in headers.items()
+            if str(k).strip() and v is not None
+        }
+        if normalized:
+            logger.debug(
+                "Auxiliary custom endpoint: applying headers from custom provider %r",
+                entry.get("name") or entry_base,
+            )
+        return normalized
+    return {}
+
+
 def _validate_proxy_env_urls() -> None:
     """Fail fast with a clear error when proxy env vars have malformed URLs.
 
@@ -1419,8 +1496,11 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
     logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
     _clean_base, _dq = _extract_url_query_params(custom_base)
     _extra = {"default_query": _dq} if _dq else {}
+    _headers = _matching_custom_provider_headers(custom_base)
+    if _headers:
+        _extra["default_headers"] = _headers
     if custom_mode == "codex_responses":
-        _extra["default_headers"] = _hermes_user_agent_headers()
+        _extra["default_headers"] = {**_extra.get("default_headers", {}), **_hermes_user_agent_headers()}
         real_client = OpenAI(api_key=custom_key, base_url=_clean_base, **_extra)
         return CodexAuxiliaryClient(real_client, model), model
     if custom_mode == "anthropic_messages":
@@ -2233,6 +2313,9 @@ def resolve_provider_client(
             _clean_base, _dq = _extract_url_query_params(custom_base)
             if _dq:
                 extra["default_query"] = _dq
+            _headers = _matching_custom_provider_headers(custom_base)
+            if _headers:
+                extra["default_headers"] = _headers
             if base_url_host_matches(custom_base, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
             elif base_url_host_matches(custom_base, "api.githubcopilot.com"):
@@ -2241,7 +2324,7 @@ def resolve_provider_client(
                     is_agent_turn=True, is_vision=is_vision
                 )
             elif api_mode == "codex_responses":
-                extra["default_headers"] = _hermes_user_agent_headers()
+                extra["default_headers"] = {**extra.get("default_headers", {}), **_hermes_user_agent_headers()}
             client = OpenAI(api_key=custom_key, base_url=_clean_base, **extra)
             client = _wrap_if_needed(client, final_model, custom_base, custom_key)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
@@ -2307,6 +2390,15 @@ def resolve_provider_client(
                     raw_base_for_wrap = custom_base
                 _clean_base2, _dq2 = _extract_url_query_params(openai_base)
                 _extra2 = {"default_query": _dq2} if _dq2 else {}
+                _headers2 = custom_entry.get("headers")
+                if isinstance(_headers2, dict):
+                    _normalized_headers2 = {
+                        str(k).strip(): str(v)
+                        for k, v in _headers2.items()
+                        if str(k).strip() and v is not None
+                    }
+                    if _normalized_headers2:
+                        _extra2["default_headers"] = _normalized_headers2
                 logger.debug(
                     "resolve_provider_client: named custom provider %r (%s, api_mode=%s)",
                     provider, final_model, entry_api_mode or "chat_completions")
@@ -2339,7 +2431,7 @@ def resolve_provider_client(
                         return AsyncAnthropicAuxiliaryClient(sync_anthropic), final_model
                     return sync_anthropic, final_model
                 if entry_api_mode == "codex_responses":
-                    _extra2["default_headers"] = _hermes_user_agent_headers()
+                    _extra2["default_headers"] = {**_extra2.get("default_headers", {}), **_hermes_user_agent_headers()}
                 client = OpenAI(api_key=custom_key, base_url=_clean_base2, **_extra2)
                 # codex_responses or inherited auto-detect (via _wrap_if_needed).
                 # _wrap_if_needed reads the closed-over `api_mode` (the task-level

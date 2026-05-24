@@ -83,6 +83,119 @@
 当前 `config.yaml` 没有显式写 API server/webhook 端口，上面这些主要是 Hermes 默认值和社区补丁配置值。
 
 
+
+## Custom provider headers / User-Agent 兼容修复
+
+### 问题现象
+
+部分 OpenAI-compatible 中转网关会检查请求头，尤其是 `User-Agent`。如果 Hermes 使用 OpenAI Python SDK 的默认请求头，可能出现：
+
+```text
+Your request was blocked.
+```
+
+或表现为主对话可用、辅助模型 / summary / provider router 路径偶发不可用，因为这些 client 不是同一个构造路径。
+
+本机 `config.yaml` 的 custom provider 里已经配置了类似浏览器或 CherryStudio 的 headers：
+
+```yaml
+custom_providers:
+- name: subapi
+  base_url: https://sub2api.codeva.top
+  headers:
+    User-Agent: Mozilla/5.0 ... CherryStudio/...
+```
+
+但 Hermes 之前并不是所有 custom provider client 都会继承这段 headers。
+
+### 根因
+
+Hermes 创建 OpenAI-compatible client 的入口不止一个：
+
+- 主对话 `AIAgent` 自己创建 OpenAI client。
+- `agent.auxiliary_client` 创建辅助模型 client。
+- `resolve_provider_client()` 给总结、视觉、压缩、自动路由等路径创建 provider client。
+- named custom provider 路径还会单独解析 `custom_providers`。
+
+之前只有部分路径会设置 provider profile 的 `default_headers`，而 raw `custom_providers[].headers` 在不少路径里没有被带过去。尤其是 custom provider 没有正式 provider profile 时，配置里的 headers 容易被遗漏。
+
+另外，`codex_responses` custom 路径为了绕过 OpenAI SDK 默认 UA，会设置 Hermes 自己的 `User-Agent`。如果直接覆盖 `default_headers`，又可能把 custom provider 中配置的其它 headers 覆盖掉。
+
+### 修复策略
+
+本修复让 custom provider 的 headers 在主对话和辅助 client 路径中保持一致：
+
+1. 在 `agent/auxiliary_client.py` 中新增：
+
+```python
+_matching_custom_provider_headers(base_url)
+```
+
+它会从配置中查找和当前 `base_url` 匹配的 custom provider，并返回其中配置的 headers。
+
+匹配时同时兼容：
+
+- `https://example.com`
+- `https://example.com/v1`
+- 经过 `_to_openai_base_url(...)` 规范化后的 OpenAI-compatible base url
+- 旧的 `custom_providers: [...]` 列表配置
+- 新的 `providers: {name: ...}` mapping 配置
+
+2. 在 auxiliary custom endpoint 路径应用这些 headers：
+
+- `_try_custom_endpoint()`
+- `resolve_provider_client()` 的 custom provider 分支
+- named custom provider 分支
+
+3. 在 `codex_responses` 路径合并 headers，而不是覆盖：
+
+```python
+_extra["default_headers"] = {
+    **_extra.get("default_headers", {}),
+    **_hermes_user_agent_headers(),
+}
+```
+
+这样既保留配置里的 headers，又确保 `codex_responses` 路径带上 Hermes 的 UA 修复。
+
+4. 在 `run_agent.py` 的主对话 OpenAI client 创建路径中，如果当前是 `provider == "custom"` 且没有 provider profile headers，就直接从 raw `custom_providers` 配置读取匹配 endpoint 的 `headers`，传给 OpenAI client 的 `default_headers`。
+
+这里特意读 raw config，而不是走 normalizer，因为 normalizer 可能会丢弃 `headers` 这类 provider-specific 扩展字段。
+
+### 修改位置
+
+- `agent/auxiliary_client.py`
+  - 新增 `_matching_custom_provider_headers(...)`
+  - custom auxiliary endpoint 应用 `default_headers`
+  - `resolve_provider_client()` custom 路径应用 `default_headers`
+  - named custom provider 路径应用 `default_headers`
+  - `codex_responses` 路径从覆盖 headers 改为合并 headers
+
+- `run_agent.py`
+  - 主对话 client 创建时，从 matching `custom_providers` entry 读取 `headers`
+  - provider profile path 额外传入 `model_lower`、`is_custom_provider`、`provider_name`，避免 profile transport 少上下文
+
+### 影响范围
+
+这个修复主要影响：
+
+```text
+custom provider + OpenAI-compatible relay/proxy + 需要自定义 headers 的网关
+```
+
+尤其是 Sub2API 这类会检查 `User-Agent` 的中转。
+
+不改变模型推理逻辑，也不改变非 custom provider 的默认请求行为。
+
+### 和 reasoning_effort 修复的关系
+
+这两个修复解决的是不同层的问题：
+
+- headers / User-Agent 修复：确保请求能被中转接受，不被网关拦截。
+- `reasoning_effort` 修复：确保请求被接受后，GPT-5.5 的推理强度字段能正确传到 Sub2API。
+
+二者叠加后，Sub2API custom provider 路径既能稳定通过网关校验，也能正确传递 reasoning 强度。
+
 ## Sub2API GPT-5.5 reasoning_effort 修复
 
 ### 问题现象

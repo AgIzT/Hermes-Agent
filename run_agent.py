@@ -1695,13 +1695,38 @@ class AIAgent:
                     # Fall back to profile.default_headers for providers that
                     # declare custom headers (e.g. Vercel AI Gateway attribution,
                     # Kimi User-Agent on non-kimi.com endpoints).
+                    _applied_profile_headers = False
                     try:
                         from providers import get_provider_profile as _gpf
                         _ph = _gpf(self.provider)
                         if _ph and _ph.default_headers:
                             client_kwargs["default_headers"] = dict(_ph.default_headers)
+                            _applied_profile_headers = True
                     except Exception:
                         pass
+                    # For custom providers without a profile, read headers from
+                    # the custom_providers config entry so relay/proxy endpoints
+                    # that require a browser-like User-Agent work correctly.
+                    if not _applied_profile_headers and self.provider == "custom":
+                        try:
+                            from hermes_cli.config import load_config as _lc
+                            _cfg = _lc()
+                            # Read directly from raw config instead of
+                            # get_compatible_custom_providers() because the
+                            # normalizer strips unknown keys like "headers".
+                            _raw_cp_list = _cfg.get("custom_providers") or []
+                            if isinstance(_raw_cp_list, list):
+                                for _cp_entry in _raw_cp_list:
+                                    if not isinstance(_cp_entry, dict):
+                                        continue
+                                    _cp_base = str(_cp_entry.get("base_url", "")).rstrip("/")
+                                    if _cp_base and effective_base.rstrip("/").startswith(_cp_base.rstrip("/")):
+                                        _cp_headers = _cp_entry.get("headers")
+                                        if isinstance(_cp_headers, dict) and _cp_headers:
+                                            client_kwargs["default_headers"] = dict(_cp_headers)
+                                        break
+                        except Exception:
+                            pass
             else:
                 # No explicit creds — use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
@@ -9801,6 +9826,9 @@ class AIAgent:
                 reasoning_config=self.reasoning_config,
                 request_overrides=self.request_overrides,
                 session_id=getattr(self, "session_id", None),
+                model_lower=(self.model or "").lower(),
+                is_custom_provider=self.provider == "custom",
+                provider_name=self.provider,
                 provider_profile=_profile,
                 ollama_num_ctx=self._ollama_num_ctx,
                 # Context forwarded to profile hooks:

@@ -10,6 +10,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import copy
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -97,6 +98,34 @@ def _is_gemini_openai_compat_base_url(base_url: Any) -> bool:
     if "generativelanguage.googleapis.com" not in normalized:
         return False
     return normalized.endswith("/openai")
+
+
+def _base_url_host_matches(base_url: Any, expected_host: str) -> bool:
+    parsed = urlparse(str(base_url or "").strip())
+    host = (parsed.hostname or "").lower()
+    return host == expected_host.lower()
+
+
+def _is_sub2api_gpt5_reasoning_route(base_url: Any, model: str, is_custom_provider: bool) -> bool:
+    if not is_custom_provider:
+        return False
+    if not _base_url_host_matches(base_url, "sub2api.codeva.top"):
+        return False
+
+    model_lower = (model or "").strip().lower()
+    if "/" in model_lower:
+        model_lower = model_lower.rsplit("/", 1)[1]
+    return model_lower.startswith("gpt-5")
+
+
+def _resolve_sub2api_reasoning_effort(reasoning_config: dict | None) -> str | None:
+    if reasoning_config and isinstance(reasoning_config, dict):
+        if reasoning_config.get("enabled") is False:
+            return None
+        effort = str(reasoning_config.get("effort") or "").strip().lower()
+        if effort:
+            return effort
+    return "medium"
 
 
 class ChatCompletionsTransport(ProviderTransport):
@@ -225,12 +254,16 @@ class ChatCompletionsTransport(ProviderTransport):
                 elif qwen_prep is not None:
                     sanitized = qwen_prep(sanitized)
 
-        # Developer role swap for GPT-5/Codex models
+        # Developer role swap for GPT-5/Codex models. Some OpenAI-compatible
+        # custom gateways reject developer-role messages when tools are present,
+        # so keep the classic system role for that compatibility case.
         model_lower = params.get("model_lower", (model or "").lower())
+        allow_developer_role = not (params.get("is_custom_provider", False) and bool(tools))
         if (
             sanitized
             and isinstance(sanitized[0], dict)
             and sanitized[0].get("role") == "system"
+            and allow_developer_role
             and any(p in model_lower for p in DEVELOPER_ROLE_MODELS)
         ):
             sanitized = list(sanitized)
@@ -277,6 +310,7 @@ class ChatCompletionsTransport(ProviderTransport):
         is_tokenhub = params.get("is_tokenhub", False)
         is_custom_provider = params.get("is_custom_provider", False)
         reasoning_config = params.get("reasoning_config")
+        base_url = params.get("base_url")
 
         if ephemeral is not None and max_tokens_fn:
             api_kwargs.update(max_tokens_fn(ephemeral))
@@ -339,6 +373,14 @@ class ChatCompletionsTransport(ProviderTransport):
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
 
+        # Sub2API's OpenAI-compatible GPT-5.x route accepts top-level
+        # reasoning_effort (not OpenRouter-style extra_body.reasoning). Keep
+        # this narrowly gated to avoid changing other custom endpoints.
+        if _is_sub2api_gpt5_reasoning_route(base_url, model, is_custom_provider):
+            _sub2api_effort = _resolve_sub2api_reasoning_effort(reasoning_config)
+            if _sub2api_effort is not None:
+                api_kwargs["reasoning_effort"] = _sub2api_effort
+
         # extra_body assembly
         extra_body: Dict[str, Any] = {}
 
@@ -346,7 +388,6 @@ class ChatCompletionsTransport(ProviderTransport):
         is_nous = params.get("is_nous", False)
         is_github_models = params.get("is_github_models", False)
         provider_name = str(params.get("provider_name") or "").strip().lower()
-        base_url = params.get("base_url")
 
         provider_prefs = params.get("provider_preferences")
         if provider_prefs and is_openrouter:

@@ -390,6 +390,61 @@ class TestBuildApiKwargsCustomEndpoint:
         extra = kwargs.get("extra_body", {})
         assert "reasoning" not in extra
 
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "xhigh"])
+    def test_sub2api_gpt5_custom_endpoint_uses_top_level_reasoning_effort(self, monkeypatch, effort):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://sub2api.codeva.top/v1",
+            model="gpt-5.5",
+        )
+        agent.reasoning_config = {"enabled": True, "effort": effort}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["reasoning_effort"] == effort
+        assert "reasoning" not in kwargs.get("extra_body", {})
+
+    def test_sub2api_gpt5_custom_endpoint_omits_reasoning_effort_when_disabled(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://sub2api.codeva.top/v1",
+            model="gpt-5.5",
+        )
+        agent.reasoning_config = {"enabled": False, "effort": "xhigh"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert "reasoning_effort" not in kwargs
+
+    def test_sub2api_non_gpt5_custom_endpoint_does_not_get_reasoning_effort(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://sub2api.codeva.top/v1",
+            model="claude-sonnet-4",
+        )
+        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert "reasoning_effort" not in kwargs
+
+    def test_gpt5_on_other_custom_endpoint_does_not_get_reasoning_effort(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://api.openai-compatible.example/v1",
+            model="gpt-5.5",
+        )
+        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert "reasoning_effort" not in kwargs
+
     def test_fireworks_tool_call_payload_strips_codex_only_fields(self, monkeypatch):
         agent = _make_agent(
             monkeypatch,

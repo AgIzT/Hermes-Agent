@@ -82,6 +82,40 @@
 
 当前 `config.yaml` 没有显式写 API server/webhook 端口，上面这些主要是 Hermes 默认值和社区补丁配置值。
 
+
+## Sub2API GPT-5.5 reasoning_effort 修复
+
+本次新增一个窄门控兼容修复：当 Hermes 走 OpenAI-compatible `chat_completions`，且满足以下条件时：
+
+- `provider == "custom"`
+- `base_url` 的 host 精确为 `sub2api.codeva.top`
+- 当前模型为 `gpt-5.x` 系列，例如 `gpt-5.5`
+
+会把 Hermes 当前动态 reasoning 配置映射到最终 HTTP JSON 的顶层字段：
+
+```json
+"reasoning_effort": "<当前 /reasoning 或 agent.reasoning_effort>"
+```
+
+也就是说，`low` / `medium` / `high` / `xhigh` 等值不会硬编码，会随当前会话的 `/reasoning` 设置变化。
+
+修改位置：
+
+- `agent/transports/chat_completions.py`
+- `tests/run_agent/test_provider_parity.py`
+
+验证记录：
+
+- `_build_api_kwargs()` 已分别验证 `low`、`medium`、`xhigh`，最终 kwargs 均包含顶层 `reasoning_effort`，且不放入 `extra_body.reasoning`。
+- 已实际向 `https://sub2api.codeva.top/v1/chat/completions` 发送 `low` 与 `xhigh` 两条请求，均返回 200，Sub2API 后台可按请求记录确认 reasoning 强度不同。
+
+禁用策略：
+
+- `reasoning_config.enabled is False` 时省略 `reasoning_effort`，表示明确关闭 reasoning。
+- `effort == "none"` 但未显式 disabled 时按接口枚举原样传 `"none"`。
+
+这个修复只作用于 Sub2API 的 custom GPT-5.x 路径，不影响 Ollama、OpenRouter、Nous、Kimi、LM Studio 等既有逻辑。
+
 ## 更新前
 
 - 重新套补丁前先做 `git apply --check`。
